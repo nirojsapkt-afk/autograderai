@@ -16,29 +16,40 @@
 <body>
   <div class="msg">
     <div class="spinner"></div>
-    <p>Completing sign in...</p>
+    <p id="statusText">
+      {% if error %}
+      {{ error }}
+      {% else %}
+      Completing sign in...
+      {% endif %}
+    </p>
   </div>
   <script>
-    // Supabase puts the session in the URL hash after OAuth
-    const hash   = window.location.hash.substring(1);
+    const statusText = document.getElementById("statusText");
+    {% if error %}
+    setTimeout(() => window.location.href = "/", 3500);
+    {% else %}
+    const hash = window.location.hash.substring(1);
     const params = new URLSearchParams(hash);
-    const token  = params.get("access_token");
+    const token = params.get("access_token");
+    const code = new URLSearchParams(window.location.search).get("code");
 
-    if (token) {
+    if (token || code) {
       fetch("/auth/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ access_token: token })
+        body: JSON.stringify({ access_token: token, code })
       })
       .then(r => r.json())
       .then(data => {
-        if (data.ok) window.location.href = "/";
-        else document.querySelector("p").textContent = "Sign in failed: " + (data.error || "unknown error");
+        if (data.ok) window.location.href = "/dashboard";
+        else statusText.textContent = "Sign in failed: " + (data.error || "unknown error");
       });
     } else {
-      document.querySelector("p").textContent = "No token found. Please try again.";
+      statusText.textContent = "No token or code found. Please try again.";
       setTimeout(() => window.location.href = "/", 3000);
     }
+    {% endif %}
   </script>
 </body>
 </html>
