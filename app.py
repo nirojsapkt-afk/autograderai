@@ -20,8 +20,6 @@ SUPABASE_KEY    = os.environ.get("SUPABASE_ANON_KEY", "")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 
-# ── Text extraction ────────────────────────────────────────────────────────────
-
 def extract_text(filename: str, file_bytes: bytes) -> str:
     ext = os.path.splitext(filename)[1].lower()
     if ext == ".pdf":
@@ -46,25 +44,21 @@ def extract_text(filename: str, file_bytes: bytes) -> str:
     raise ValueError(f"Could not decode '{filename}' as text.")
 
 
-# ── Auth helpers ───────────────────────────────────────────────────────────────
-
 def get_current_user():
-    """Return user dict from session, or None."""
     return session.get("user")
 
 
 def require_login(f):
-    """Decorator — redirects to grading page if not logged in."""
     from functools import wraps
+
     @wraps(f)
     def decorated(*args, **kwargs):
         if not get_current_user():
             return jsonify({"error": "Not authenticated"}), 401
         return f(*args, **kwargs)
+
     return decorated
 
-
-# ── Pages ──────────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -80,11 +74,8 @@ def dashboard():
     return render_template("dashboard.html", user=user)
 
 
-# ── Auth routes ────────────────────────────────────────────────────────────────
-
 @app.route("/auth/google")
 def auth_google():
-    """Redirect to Supabase Google OAuth."""
     if not supabase:
         return jsonify({"error": "Supabase not configured"}), 500
     redirect_url = os.environ.get("SITE_URL", request.host_url.rstrip("/")) + "/auth/callback"
@@ -97,27 +88,61 @@ def auth_google():
 
 @app.route("/auth/callback")
 def auth_callback():
-    """Supabase redirects here after Google login."""
-    # Supabase sends the session via URL fragment (#) which JS handles.
-    # We render a small page that reads the fragment and calls /auth/session.
+    if not supabase:
+        return jsonify({"error": "Supabase not configured"}), 500
+
+    error = request.args.get("error")
+    if error:
+        description = request.args.get("error_description", error)
+        return render_template("auth_callback.html", error=description)
+
+    auth_code = request.args.get("code", "").strip()
+    if auth_code:
+        try:
+            exchange = supabase.auth.exchange_code_for_session({"auth_code": auth_code})
+            session_data = getattr(exchange, "session", None)
+            access_token = getattr(session_data, "access_token", "") if session_data else ""
+            user_resp = supabase.auth.get_user(access_token) if access_token else supabase.auth.get_user()
+            user = user_resp.user
+            session["user"] = {
+                "id": user.id,
+                "email": user.email,
+                "name": user.user_metadata.get("full_name", user.email),
+                "avatar": user.user_metadata.get("avatar_url", ""),
+                "token": access_token,
+            }
+            return redirect(url_for("dashboard"))
+        except Exception as e:
+            return render_template("auth_callback.html", error=f"Sign in failed: {e}")
+
     return render_template("auth_callback.html")
 
 
 @app.route("/auth/session", methods=["POST"])
 def auth_session():
-    """JS posts the access_token here so we can store it server-side."""
-    data         = request.get_json()
+    data = request.get_json()
+    if not supabase:
+        return jsonify({"error": "Supabase not configured"}), 500
+
     access_token = data.get("access_token", "")
-    if not access_token or not supabase:
-        return jsonify({"error": "Missing token"}), 400
+    auth_code = data.get("code", "")
+
     try:
+        if auth_code:
+            exchange = supabase.auth.exchange_code_for_session({"auth_code": auth_code})
+            session_data = getattr(exchange, "session", None)
+            access_token = getattr(session_data, "access_token", "") if session_data else ""
+
+        if not access_token:
+            return jsonify({"error": "Missing token"}), 400
+
         user_resp = supabase.auth.get_user(access_token)
-        user      = user_resp.user
+        user = user_resp.user
         session["user"] = {
-            "id":    user.id,
+            "id": user.id,
             "email": user.email,
-            "name":  user.user_metadata.get("full_name", user.email),
-            "avatar":user.user_metadata.get("avatar_url", ""),
+            "name": user.user_metadata.get("full_name", user.email),
+            "avatar": user.user_metadata.get("avatar_url", ""),
             "token": access_token,
         }
         return jsonify({"ok": True, "user": session["user"]})
@@ -138,8 +163,6 @@ def auth_me():
         return jsonify({"user": user})
     return jsonify({"user": None})
 
-
-# ── Grading ────────────────────────────────────────────────────────────────────
 
 @app.route("/grade", methods=["POST"])
 def grade():
@@ -174,7 +197,7 @@ def grade():
             return jsonify({"error": str(e)}), 422
     work_block = "\n\n".join(work_blocks)
 
-    grade_level          = request.form.get("grade_level", "").strip()
+    grade_level = request.form.get("grade_level", "").strip()
     special_instructions = request.form.get("special_instructions", "").strip()
 
     grade_block = ""
@@ -187,16 +210,16 @@ def grade():
 
     prompt = f"""You are an expert teacher grading student work. Produce highly specific, evidence-based feedback.
 
-ANTI-HALLUCINATION RULES — FOLLOW STRICTLY:
+ANTI-HALLUCINATION RULES - FOLLOW STRICTLY:
 1. You may ONLY reference content that is LITERALLY AND EXPLICITLY present in the student's work provided below.
 2. Do NOT invent, assume, or fabricate any quotes, paragraph references, section names, or examples that are not directly in the text.
-3. If you cannot find specific evidence for a point, say "The work does not contain sufficient evidence to assess [X]" — do not make something up.
+3. If you cannot find specific evidence for a point, say "The work does not contain sufficient evidence to assess [X]" - do not make something up.
 4. Every piece of feedback must be traceable to actual text in the student's work. If you reference "paragraph 2" or quote something, it must exist verbatim in the student's work below.
 5. Do NOT reference topics, sources, authors, or arguments that do not appear in the student's work.
 
 FEEDBACK QUALITY RULES:
 6. Never use vague phrases like "could be better", "needs improvement", "good job". Replace every vague phrase with a specific observation tied to actual content from the student's work.
-7. For each criterion, explain your reasoning — why did you assign that score? What specific text supports it?
+7. For each criterion, explain your reasoning - why did you assign that score? What specific text supports it?
 8. Use varied language: "notably", "specifically", "for instance", "your section on X states...", "the passage where you write...".
 9. If an answer key is provided, check each answer explicitly against it.
 10. Calculate the final score using weighted categories if the rubric specifies weights.
@@ -204,7 +227,7 @@ FEEDBACK QUALITY RULES:
 RUBRIC / ANSWER KEY:
 {rubric_text}
 
-STUDENT WORK (only reference content from this — nothing else):
+STUDENT WORK (only reference content from this - nothing else):
 {work_block}
 
 Respond ONLY with a JSON object in this exact format (no markdown, no backticks):
@@ -222,11 +245,11 @@ Respond ONLY with a JSON object in this exact format (no markdown, no backticks)
       "points_earned": <number>,
       "points_possible": <number>,
       "status": "<pass|partial|fail>",
-      "feedback": "<SPECIFIC feedback referencing only actual content from the student work — quote or reference specific text that is literally present. Explain WHY this score was given with evidence from the actual work.>"
+      "feedback": "<SPECIFIC feedback referencing only actual content from the student work - quote or reference specific text that is literally present. Explain WHY this score was given with evidence from the actual work.>"
     }}
   ],
-  "strengths": "<Specific paragraph referencing actual content from the student work — only quote or reference text that is literally present>",
-  "improvements": "<Specific paragraph with exact locations in the actual work — only reference content that literally exists in the student submission>",
+  "strengths": "<Specific paragraph referencing actual content from the student work - only quote or reference text that is literally present>",
+  "improvements": "<Specific paragraph with exact locations in the actual work - only reference content that literally exists in the student submission>",
   "summary": "<2-3 sentence honest overall summary referencing the actual work>"
 }}"""
 
@@ -244,38 +267,35 @@ Respond ONLY with a JSON object in this exact format (no markdown, no backticks)
     try:
         resp = requests.post(GROQ_API_URL, json=payload, headers=headers, timeout=60)
         resp.raise_for_status()
-        result    = resp.json()
-        text      = result["choices"][0]["message"]["content"]
-        clean     = text.replace("```json", "").replace("```", "").strip()
-        parsed    = json.loads(clean)
+        result = resp.json()
+        text = result["choices"][0]["message"]["content"]
+        clean = text.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(clean)
 
-        # Save to Supabase if user is logged in
         user = get_current_user()
         if user and supabase:
             try:
                 supabase.table("grades").insert({
-                    "user_id":      user["id"],
-                    "score":        parsed.get("score"),
-                    "letter":       parsed.get("letter"),
-                    "confidence":   parsed.get("confidence"),
-                    "grade_level":  grade_level or None,
-                    "work_files":   work_filenames,
+                    "user_id": user["id"],
+                    "score": parsed.get("score"),
+                    "letter": parsed.get("letter"),
+                    "confidence": parsed.get("confidence"),
+                    "grade_level": grade_level or None,
+                    "work_files": work_filenames,
                     "rubric_files": [f.filename for f in rubric_uploads],
-                    "result":       parsed,
+                    "result": parsed,
                 }).execute()
             except Exception:
-                pass  # Don't fail grading if save fails
+                pass
 
         return jsonify({"result": text})
     except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"Groq API error: {e.response.status_code} — {e.response.text}"}), 502
+        return jsonify({"error": f"Groq API error: {e.response.status_code} - {e.response.text}"}), 502
     except requests.exceptions.Timeout:
         return jsonify({"error": "Request to Groq timed out."}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-# ── Dashboard API ──────────────────────────────────────────────────────────────
 
 @app.route("/api/grades")
 @require_login
