@@ -12,15 +12,15 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-change-in-produc
 CORS(app)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB
 
-GROQ_API_URL    = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
-SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY    = os.environ.get("SUPABASE_ANON_KEY", "")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY else None
 
-
-# —— Text extraction ————————————————————————————————————————————————————————————————
 
 def extract_text(filename: str, file_bytes: bytes) -> str:
     ext = os.path.splitext(filename)[1].lower()
@@ -46,25 +46,28 @@ def extract_text(filename: str, file_bytes: bytes) -> str:
     raise ValueError(f"Could not decode '{filename}' as text.")
 
 
-# —— Auth helpers ————————————————————————————————————————————————————————————————
-
 def get_current_user():
     """Return user dict from session, or None."""
     return session.get("user")
 
 
+def get_db_client():
+    """Use the service role for server-side grade history operations."""
+    return supabase_admin or supabase
+
+
 def require_login(f):
     """Decorator — redirects to grading page if not logged in."""
     from functools import wraps
+
     @wraps(f)
     def decorated(*args, **kwargs):
         if not get_current_user():
             return jsonify({"error": "Not authenticated"}), 401
         return f(*args, **kwargs)
+
     return decorated
 
-
-# —— Pages ————————————————————————————————————————————————————————————————————————
 
 @app.route("/")
 def index():
@@ -79,8 +82,6 @@ def dashboard():
         return redirect("/")
     return render_template("dashboard.html", user=user)
 
-
-# —— Auth routes ————————————————————————————————————————————————————————————————
 
 @app.route("/auth/google")
 def auth_google():
@@ -132,12 +133,12 @@ def auth_callback():
 @app.route("/auth/session", methods=["POST"])
 def auth_session():
     """JS posts the access_token here so we can store it server-side."""
-    data         = request.get_json()
+    data = request.get_json()
     if not supabase:
         return jsonify({"error": "Supabase not configured"}), 500
 
     access_token = data.get("access_token", "")
-    auth_code    = data.get("code", "")
+    auth_code = data.get("code", "")
 
     try:
         if auth_code:
@@ -149,12 +150,12 @@ def auth_session():
             return jsonify({"error": "Missing token"}), 400
 
         user_resp = supabase.auth.get_user(access_token)
-        user      = user_resp.user
+        user = user_resp.user
         session["user"] = {
-            "id":    user.id,
+            "id": user.id,
             "email": user.email,
-            "name":  user.user_metadata.get("full_name", user.email),
-            "avatar":user.user_metadata.get("avatar_url", ""),
+            "name": user.user_metadata.get("full_name", user.email),
+            "avatar": user.user_metadata.get("avatar_url", ""),
             "token": access_token,
         }
         return jsonify({"ok": True, "user": session["user"]})
@@ -175,8 +176,6 @@ def auth_me():
         return jsonify({"user": user})
     return jsonify({"user": None})
 
-
-# —— Grading ————————————————————————————————————————————————————————————————————————
 
 @app.route("/grade", methods=["POST"])
 def grade():
@@ -211,7 +210,7 @@ def grade():
             return jsonify({"error": str(e)}), 422
     work_block = "\n\n".join(work_blocks)
 
-    grade_level          = request.form.get("grade_level", "").strip()
+    grade_level = request.form.get("grade_level", "").strip()
     special_instructions = request.form.get("special_instructions", "").strip()
 
     grade_block = ""
@@ -281,27 +280,35 @@ Respond ONLY with a JSON object in this exact format (no markdown, no backticks)
     try:
         resp = requests.post(GROQ_API_URL, json=payload, headers=headers, timeout=60)
         resp.raise_for_status()
-        result    = resp.json()
-        text      = result["choices"][0]["message"]["content"]
-        clean     = text.replace("```json", "").replace("```", "").strip()
-        parsed    = json.loads(clean)
+        result = resp.json()
+        text = result["choices"][0]["message"]["content"]
+        clean = text.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(clean)
 
-        # Save to Supabase if user is logged in
-        user = get_current_user()
-        if user and supabase:
-            try:
-                supabase.table("grades").insert({
-                    "user_id":      user["id"],
-                    "score":        parsed.get("score"),
-                    "letter":       parsed.get("letter"),
-                    "confidence":   parsed.get("confidence"),
-                    "grade_level":  grade_level or None,
-                    "work_files":   work_filenames,
-                    "rubric_files": [f.filename for f in rubric_uploads],
-                    "result":       parsed,
-                }).execute()
-            except Exception:
-                pass  # Don't fail grading if save fails
+        db_client = get_db_client()
+        if user := get_current_user():
+            if db_client:
+                try:
+                    db_client.table("grades").insert({
+                        "user_id": user["id"],
+                        "score": parsed.get("score"),
+                        "letter": parsed.get("letter"),
+                        "confidence": parsed.get("confidence"),
+                        "grade_level": grade_level or None,
+                        "work_files": work_filenames,
+                        "rubric_files": [f.filename for f in rubric_uploads],
+                        "result": parsed,
+                    }).execute()
+                except Exception as e:
+                    return jsonify({
+                        "result": text,
+                        "warning": f"Grade was generated but could not be saved to the dashboard: {e}"
+                    })
+            else:
+                return jsonify({
+                    "result": text,
+                    "warning": "Grade was generated but could not be saved because the Supabase database client is not configured."
+                })
 
         return jsonify({"result": text})
     except requests.exceptions.HTTPError as e:
@@ -312,14 +319,16 @@ Respond ONLY with a JSON object in this exact format (no markdown, no backticks)
         return jsonify({"error": str(e)}), 500
 
 
-# —— Dashboard API ————————————————————————————————————————————————————————————————
-
 @app.route("/api/grades")
 @require_login
 def api_grades():
     user = get_current_user()
     try:
-        resp = supabase.table("grades") \
+        db_client = get_db_client()
+        if not db_client:
+            return jsonify({"error": "Supabase database client is not configured."}), 500
+
+        resp = db_client.table("grades") \
             .select("*") \
             .eq("user_id", user["id"]) \
             .order("created_at", desc=True) \
@@ -334,7 +343,11 @@ def api_grades():
 def api_delete_grade(grade_id):
     user = get_current_user()
     try:
-        supabase.table("grades") \
+        db_client = get_db_client()
+        if not db_client:
+            return jsonify({"error": "Supabase database client is not configured."}), 500
+
+        db_client.table("grades") \
             .delete() \
             .eq("id", grade_id) \
             .eq("user_id", user["id"]) \
